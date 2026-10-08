@@ -19,6 +19,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.Executors
+import kotlinx.coroutines.launch
 
 /**
  * Camera + detection pipeline, fully offline:
