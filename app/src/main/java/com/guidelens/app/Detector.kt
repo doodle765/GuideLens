@@ -29,7 +29,7 @@ class Detector(context: Context) {
         private const val TAG = "GuideLens/Detector"
 
         const val HFOV_DEG = 62.0
-        const val MIN_SCORE = 0.35f
+        const val MIN_SCORE = 0.5f
         const val MAX_RESULTS = 25
 
         // Assumed real-world heights (m) used for monocular distance estimation
@@ -200,6 +200,8 @@ class Detector(context: Context) {
             val bottom = boxes[0][i][2].coerceIn(0f, 1f)
             val right = boxes[0][i][3].coerceIn(0f, 1f)
             val box = RectF(left * fw, top * fh, right * fw, bottom * fh)
+            // ignore tiny detections (texture noise, shadows, far-away clutter)
+            if (box.height() < fh * 0.05f && box.width() < fw * 0.05f) continue
 
             val label = FRIENDLY[raw] ?: raw
             val dist = estDistance(raw, box.height(), fh, fw)
