@@ -1,5 +1,6 @@
 package com.guidelens.app
 
+import android.util.Log
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -36,6 +37,10 @@ class CameraController(
 
     private var loopJob: Job? = null
     private var provider: ProcessCameraProvider? = null
+
+    /** Failures must never be silent again: remember the last loop error so we
+     *  only surface it once instead of spamming every 420 ms frame. */
+    private var lastLoopError: String? = null
 
     @Volatile var running = false
         private set
@@ -82,11 +87,22 @@ class CameraController(
             val frame = try { previewView.bitmap } catch (e: Exception) { null }
             if (frame != null) {
                 val dets = withContext(Dispatchers.IO) {
-                    runCatching { detector.detect(frame) }.getOrElse { emptyList() }
+                    try {
+                        detector.detect(frame)
+                    } catch (e: Exception) {
+                        val msg = e.message ?: e.javaClass.simpleName
+                        if (msg != lastLoopError) {
+                            lastLoopError = msg
+                            Log.e("GuideLens/Camera", "detect() failed", e)
+                            onStatus("Detection error: $msg")
+                        }
+                        emptyList()
+                    }
                 }
                 val zone = withContext(Dispatchers.IO) {
-                    if (segmenter.available) runCatching { segmenter.analyze(frame) }.getOrNull()
-                    else null
+                    if (segmenter.available) {
+                        try { segmenter.analyze(frame) } catch (e: Exception) { null }
+                    } else null
                 }
                 lastSeen = dets
                 lastZone = zone

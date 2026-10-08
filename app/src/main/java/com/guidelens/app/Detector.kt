@@ -3,6 +3,7 @@ package com.guidelens.app
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.RectF
+import android.util.Log
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.Interpreter
 import java.io.FileInputStream
@@ -16,16 +17,17 @@ import kotlin.math.tan
 /**
  * Object detection, fully on-device.
  *
- * Model: SSD MobileNetV2 FPNLite 320x320 from TensorFlow Hub
- * (https://tfhub.dev/tensorflow/lite-model/ssd_mobilenet_v2/fpnlite/320x320),
- * downloaded into assets by the downloadModels gradle task.
+ * Model: SSD MobileNet TF1 export (TFLite_Detection_PostProcess, 0-based COCO
+ * class indices, downloaded into assets by the downloadModels gradle task).
  *
- * Output tensors are resolved BY NAME at runtime, so the wrapper is robust to
- * model variants (4-output TF1 export or 6-output TF2 export).
+ * TF1 exports have 4 outputs with IDENTICAL names, resolved via the fallback
+ * branch; TF2 exports (named tensors, 1-based ids) are handled by name matching.
  */
 class Detector(context: Context) {
 
     companion object {
+        private const val TAG = "GuideLens/Detector"
+
         const val HFOV_DEG = 62.0
         const val MIN_SCORE = 0.45f
         const val MAX_RESULTS = 25
@@ -45,7 +47,7 @@ class Detector(context: Context) {
             "motorcycle" to "motorcycle", "bench" to "bench", "chair" to "chair"
         )
 
-        // COCO 90-category map (index = class id, 0 = background/unused)
+        // 1-based map with background/"object" at 0 (used for TF2 named exports)
         val LABELS = listOf(
             "object",
             "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
@@ -64,6 +66,10 @@ class Detector(context: Context) {
             "refrigerator", "blender", "book", "clock", "vase", "scissors",
             "teddy bear", "hair drier", "toothbrush"
         )
+
+        // 0-based COCO list for TF1 TFLite_Detection_PostProcess exports:
+        // index 0 = person (this is what the bundled detect.tflite outputs).
+        val LABELS_0BASED = LABELS.drop(1)
     }
 
     private var interpreter: Interpreter? = null
@@ -80,8 +86,13 @@ class Detector(context: Context) {
                 FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength)
             interpreter = Interpreter(model, Interpreter.Options().apply { numThreads = 4 })
             ok = true
+            val itp = interpreter!!
+            val inT = itp.getInputTensor(0)
+            Log.i(TAG, "model loaded: input ${inT.shape().contentToString()} ${inT.dataType()}, " +
+                    "$itp.outputTensorCount outputs")
         } catch (e: Exception) {
             err = e.message ?: "model load failed"
+            Log.e(TAG, "model load failed", e)
         }
         available = ok
         error = err
@@ -140,14 +151,20 @@ class Detector(context: Context) {
                 "class" in nm -> if (iClasses < 0) iClasses = i
             }
         }
-        // ---- fallback: classic TF1 export ("TFLite_Detection_PostProcess" x4),
-        //      output order is always [boxes, classes, scores, num] ----
+
+        // ---- labels: TF1 exports (all outputs share one name, or >=4 unnamed
+        //      outputs) use 0-based class ids; named TF2 exports use the 1-based map
+        val labels: List<String>
         if (iBoxes < 0 || iScores < 0) {
             if (itp.outputTensorCount >= 4) {
                 iBoxes = 0; iClasses = 1; iScores = 2; iNum = 3
+                labels = LABELS_0BASED
             } else {
+                Log.w(TAG, "unrecognized model: ${itp.outputTensorCount} outputs, no boxes/scores")
                 return emptyList()
             }
+        } else {
+            labels = LABELS
         }
 
         val maxD = run {
@@ -169,13 +186,13 @@ class Detector(context: Context) {
         itp.runForMultipleInputsOutputs(arrayOf(input), outputs)
 
         val n = (if (iNum >= 0) nums[0].toInt() else maxD).coerceIn(0, maxD)
+        Log.d(TAG, "raw: n=$n maxScore=${scores[0].maxOrNull() ?: 0f}")
         val out = mutableListOf<Detection>()
         for (i in 0 until n) {
             val score = scores[0][i]
             if (score < MIN_SCORE) continue
             val clsInt = if (iClasses >= 0) classes[0][i].toInt() else 0
-            val raw = LABELS.getOrNull(clsInt) ?: continue
-            if (raw == "object") continue
+            val raw = labels.getOrNull(clsInt) ?: continue
 
             // boxes are normalized [ymin, xmin, ymax, xmax]
             val top = boxes[0][i * 4 + 0].coerceIn(0f, 1f)
@@ -194,6 +211,7 @@ class Detector(context: Context) {
             }
             out.add(Detection(label, score, box, dist, side))
         }
+        Log.d(TAG, "detections passed: ${out.size}")
         return out
     }
 
