@@ -1,24 +1,32 @@
 package com.guidelens.app
 
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Matrix
+import android.graphics.Rect
+import android.graphics.RectF
+import android.graphics.YuvImage
 import android.util.Log
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.lifecycle.LifecycleOwner
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.SupervisorJob
+import java.io.ByteArrayOutputStream
 import java.util.concurrent.Executors
 
 /**
  * Camera + detection pipeline, fully offline:
- * CameraX preview -> grab frames from PreviewView -> COCO-SSD (named objects)
- * and optional DeepLab zones (poles/walls/fences) -> tiered alerts -> overlay.
+ * CameraX Preview (live feed) + ImageAnalysis (frame stream) ->
+ * COCO-SSD object detection -> tiered alerts -> overlay.
+ *
+ * NOTE: PreviewView.getBitmap() returns null on many Xiaomi/MIUI devices,
+ * so frames come from an ImageAnalysis use case instead.
  */
 class CameraController(
     private val activity: androidx.activity.ComponentActivity,
@@ -29,17 +37,13 @@ class CameraController(
     private val alerts: AlertCenter,
     private val onStatus: (String) -> Unit
 ) {
-    private val scope = CoroutineScope(Dispatchers.Main + kotlinx.coroutines.SupervisorJob())
+    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private val inferenceExecutor = Executors.newSingleThreadExecutor()
 
     private val detector = Detector(activity)
     private val segmenter = Segmenter(activity)
 
-    private var loopJob: Job? = null
     private var provider: ProcessCameraProvider? = null
-
-    /** Failures must never be silent again: remember the last loop error so we
-     *  only surface it once instead of spamming every 420 ms frame. */
     private var lastLoopError: String? = null
 
     @Volatile var running = false
@@ -57,14 +61,15 @@ class CameraController(
             return
         }
         onStatus("Starting camera…")
-        scope.launch {
+        scope.launch(Dispatchers.Main) {
             try {
-                provider = withContext(Dispatchers.IO) { ProcessCameraProvider.getInstance(activity).get() }
-                bindPreview()
+                provider = kotlinx.coroutines.withContext(Dispatchers.IO) {
+                    ProcessCameraProvider.getInstance(activity).get()
+                }
+                bindUseCases()
                 val segNote = if (segmenter.available) "" else " Scene model unavailable on this device."
                 onStatus("Detection running. Hold the phone at chest height, camera facing forward." + segNote)
                 speaker.speak("Detection running. I'll warn you about obstacles.")
-                loopJob = scope.launch(Dispatchers.Default) { detectionLoop() }
             } catch (e: Exception) {
                 running = false
                 onStatus("Camera unavailable: " + (e.message ?: "unknown error"))
@@ -73,75 +78,98 @@ class CameraController(
         }
     }
 
-    private fun bindPreview() {
+    private fun bindUseCases() {
         val p = provider ?: return
+
         val preview = Preview.Builder().build().also {
             it.setSurfaceProvider(previewView.surfaceProvider)
         }
+
+        val analysis = ImageAnalysis.Builder()
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .build()
+        analysis.setAnalyzer(inferenceExecutor) { proxy -> processFrame(proxy) }
+
         p.unbindAll()
-        p.bindToLifecycle(activity as LifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview)
+        p.bindToLifecycle(
+            activity as LifecycleOwner,
+            CameraSelector.DEFAULT_BACK_CAMERA,
+            preview,
+            analysis
+        )
     }
 
-    private suspend fun detectionLoop() {
-        while (scope.coroutineContext.isActive && running) {
-            val frame = try { previewView.bitmap } catch (e: Exception) { null }
-            if (frame != null) {
-                val dets = withContext(Dispatchers.IO) {
-                    try {
-                        detector.detect(frame)
-                    } catch (e: Exception) {
-                        val msg = e.message ?: e.javaClass.simpleName
-                        if (msg != lastLoopError) {
-                            lastLoopError = msg
-                            Log.e("GuideLens/Camera", "detect() failed", e)
-                            onStatus("Detection error: $msg")
-                        }
-                        emptyList()
-                    }
-                }
-                val zone = withContext(Dispatchers.IO) {
-                    if (segmenter.available) {
-                        try { segmenter.analyze(frame) } catch (e: Exception) { null }
-                    } else null
-                }
-                lastSeen = dets
-                lastZone = zone
+    /** Runs on the inference thread for every camera frame. */
+    private fun processFrame(proxy: ImageProxy) {
+        try {
+            val bmp = proxy.toBitmapRotated()
 
-                // spoken alerts
-                var anyDanger = false
-                for (d in dets) {
-                    val dist = d.dist ?: continue
-                    alerts.alert(d.label, d.side, dist)
-                    if (dist <= 3f) anyDanger = true
-                }
-                zone?.let { z ->
-                    if (System.currentTimeMillis() > alerts.namedDangerUntil) {
-                        alerts.alert("obstacle", "ahead", z.dist)
-                        if (z.dist <= 3f) anyDanger = true
-                    }
-                }
-
-                // overlay
-                val boxes = dets.map { d ->
-                    val sev = when {
-                        (d.dist ?: 99f) <= 3f -> 2
-                        (d.dist ?: 99f) <= 5f -> 1
-                        else -> 0
-                    }
-                    val label = d.dist?.let { "${d.label} %.1f m".format(it) } ?: d.label
-                    OverlayView.Box(label, d.box, sev)
-                }
-                withContext(Dispatchers.Main) { overlay.update(boxes, zone) }
-                if (anyDanger) onStatus("Stop! Obstacle ahead.")
+            val dets = try {
+                detector.detect(bmp)
+            } catch (e: Exception) {
+                reportOnce("detect", e)
+                emptyList()
             }
-            delay(420)
+            val zone = if (segmenter.available) {
+                try { segmenter.analyze(bmp) } catch (e: Exception) { null }
+            } else null
+
+            lastSeen = dets
+            lastZone = zone
+
+            // spoken alerts
+            var anyDanger = false
+            for (d in dets) {
+                val dist = d.dist ?: continue
+                alerts.alert(d.label, d.side, dist)
+                if (dist <= 3f) anyDanger = true
+            }
+            zone?.let { z ->
+                if (System.currentTimeMillis() > alerts.namedDangerUntil) {
+                    alerts.alert("obstacle", "ahead", z.dist)
+                    if (z.dist <= 3f) anyDanger = true
+                }
+            }
+
+            // overlay: scale detection coordinates to the overlay view size
+            val ow = overlay.width.takeIf { it > 0 } ?: bmp.width
+            val oh = overlay.height.takeIf { it > 0 } ?: bmp.height
+            val sx = ow / bmp.width.toFloat()
+            val sy = oh / bmp.height.toFloat()
+
+            val boxes = dets.map { d ->
+                val sev = when {
+                    (d.dist ?: 99f) <= 3f -> 2
+                    (d.dist ?: 99f) <= 5f -> 1
+                    else -> 0
+                }
+                val label = d.dist?.let { "${d.label} %.1f m".format(it) } ?: d.label
+                OverlayView.Box(
+                    label,
+                    RectF(d.box.left * sx, d.box.top * sy, d.box.right * sx, d.box.bottom * sy),
+                    sev
+                )
+            }
+            overlay.update(boxes, zone)
+            if (anyDanger) activity.runOnUiThread { onStatus("Stop! Obstacle ahead.") }
+        } catch (e: Exception) {
+            reportOnce("frame", e)
+        } finally {
+            proxy.close()
+        }
+    }
+
+    private fun reportOnce(where: String, e: Exception) {
+        val msg = e.message ?: e.javaClass.simpleName
+        if (msg != lastLoopError) {
+            lastLoopError = msg
+            Log.e("GuideLens/Camera", "$where failed", e)
+            activity.runOnUiThread { onStatus("Detection error: $msg") }
         }
     }
 
     fun stop() {
         running = false
-        loopJob?.cancel()
-        loopJob = null
         try { provider?.unbindAll() } catch (e: Exception) { }
         lastSeen = emptyList()
         lastZone = null
@@ -152,4 +180,30 @@ class CameraController(
         stop()
         inferenceExecutor.shutdown()
     }
+}
+
+/** YUV_420_888 -> upright Bitmap (NV21 -> JPEG -> rotate to display orientation). */
+private fun ImageProxy.toBitmapRotated(): Bitmap {
+    val y = planes[0].buffer
+    val u = planes[1].buffer
+    val v = planes[2].buffer
+    val ys = y.remaining()
+    val us = u.remaining()
+    val vs = v.remaining()
+    val nv21 = ByteArray(ys + vs + us)
+    y.get(nv21, 0, ys)
+    v.get(nv21, ys, vs)
+    u.get(nv21, ys + vs, us)
+
+    val yuv = YuvImage(nv21, android.graphics.ImageFormat.NV21, width, height, null)
+    val out = ByteArrayOutputStream()
+    yuv.compressToJpeg(Rect(0, 0, width, height), 100, out)
+    var bmp = BitmapFactory.decodeByteArray(out.toByteArray(), 0, out.size())
+
+    val rot = imageInfo.rotationDegrees
+    if (rot != 0) {
+        val m = Matrix().apply { postRotate(rot.toFloat()) }
+        bmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+    }
+    return bmp
 }
