@@ -172,7 +172,7 @@ class Detector(context: Context) {
             if (s.size >= 3) s[1] else MAX_RESULTS
         }
 
-        val boxes = Array(1) { FloatArray(maxD * 4) }
+        val boxes = Array(1) { Array(maxD) { FloatArray(4) } }
         val classes = Array(1) { FloatArray(maxD) }
         val scores = Array(1) { FloatArray(maxD) }
         val nums = FloatArray(1)
@@ -195,10 +195,10 @@ class Detector(context: Context) {
             val raw = labels.getOrNull(clsInt) ?: continue
 
             // boxes are normalized [ymin, xmin, ymax, xmax]
-            val top = boxes[0][i * 4 + 0].coerceIn(0f, 1f)
-            val left = boxes[0][i * 4 + 1].coerceIn(0f, 1f)
-            val bottom = boxes[0][i * 4 + 2].coerceIn(0f, 1f)
-            val right = boxes[0][i * 4 + 3].coerceIn(0f, 1f)
+            val top = boxes[0][i][0].coerceIn(0f, 1f)
+            val left = boxes[0][i][1].coerceIn(0f, 1f)
+            val bottom = boxes[0][i][2].coerceIn(0f, 1f)
+            val right = boxes[0][i][3].coerceIn(0f, 1f)
             val box = RectF(left * fw, top * fh, right * fw, bottom * fh)
 
             val label = FRIENDLY[raw] ?: raw
