@@ -185,21 +185,39 @@ class CameraController(
 }
 
 /** YUV_420_888 -> upright Bitmap (NV21 -> JPEG -> rotate to display orientation). */
+/** YUV_420_888 -> upright Bitmap with correct chroma handling (no color swap). */
 private fun ImageProxy.toBitmapRotated(): Bitmap {
-    val y = planes[0].buffer
-    val u = planes[1].buffer
-    val v = planes[2].buffer
-    val ys = y.remaining()
-    val us = u.remaining()
-    val vs = v.remaining()
-    val nv21 = ByteArray(ys + vs + us)
-    y.get(nv21, 0, ys)
-    v.get(nv21, ys, vs)
-    u.get(nv21, ys + vs, us)
+    val yP = planes[0]
+    val uP = planes[1]
+    val vP = planes[2]
+    val ySize = width * height
+    val nv21 = ByteArray(ySize + ySize / 2)
+
+    // luma
+    if (yP.rowStride == width && yP.pixelStride == 1) {
+        yP.buffer.get(nv21, 0, ySize)
+    } else {
+        var p = 0
+        for (row in 0 until height) {
+            for (col in 0 until width) {
+                nv21[p++] = yP.buffer.get(row * yP.rowStride + col * yP.pixelStride)
+            }
+        }
+    }
+
+    // chroma: NV21 = interleaved VU, honoring row/pixel stride
+    val cw = width / 2
+    val ch = height / 2
+    for (row in 0 until ch) {
+        for (col in 0 until cw) {
+            nv21[ySize + 2 * (row * cw + col)] = vP.buffer.get(row * vP.rowStride + col * vP.pixelStride)
+            nv21[ySize + 2 * (row * cw + col) + 1] = uP.buffer.get(row * uP.rowStride + col * uP.pixelStride)
+        }
+    }
 
     val yuv = YuvImage(nv21, android.graphics.ImageFormat.NV21, width, height, null)
     val out = ByteArrayOutputStream()
-    yuv.compressToJpeg(Rect(0, 0, width, height), 100, out)
+    yuv.compressToJpeg(Rect(0, 0, width, height), 90, out)
     var bmp = BitmapFactory.decodeByteArray(out.toByteArray(), 0, out.size())
 
     val rot = imageInfo.rotationDegrees
