@@ -1,0 +1,85 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v5
+        with:
+          gradle-version: "8.7"
+
+      - name: Fetch object-detection model (if not committed)
+        run: |
+          mkdir -p app/src/main/assets
+          F=app/src/main/assets/detect.tflite
+          echo "--- assets folder contents ---"
+          ls -la app/src/main/assets/ || true
+          valid() { [ -f "$F" ] && [ "$(dd if="$F" bs=1 skip=4 count=4 2>/dev/null)" = "TFL3" ]; }
+          if valid; then
+            echo "detect.tflite already committed ($(wc -c < "$F") bytes) - no download needed"
+          else
+            if [ -f "$F" ]; then
+              echo "Committed file is NOT a valid TFLite model. Its first 16 bytes:"
+              od -A x -t x1z -v "$F" | head -2 || true
+              rm -f "$F"
+            fi
+            ok=0
+            for url in \
+              "https://cdn.jsdelivr.net/gh/am15h/object_detection_flutter@master/assets/detect.tflite" \
+              "https://cdn.jsdelivr.net/gh/am15h/object_detection_flutter@main/assets/detect.tflite" \
+              "https://raw.githubusercontent.com/am15h/object_detection_flutter/master/assets/detect.tflite" \
+              "https://raw.githubusercontent.com/am15h/object_detection_flutter/main/assets/detect.tflite"; do
+              echo "Trying: $url"
+              if curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 -o "$F" "$url"; then
+                if valid; then
+                  echo "Model OK: $(wc -c < "$F") bytes"; ok=1; break
+                else
+                  echo "Response was not a TFLite file. First bytes:"; od -A x -t x1z -v "$F" | head -2 || true
+                  rm -f "$F"
+                fi
+              fi
+            done
+            if [ "$ok" != "1" ]; then
+              echo "::error::Could not obtain a valid detect.tflite from any mirror. Download it manually from https://github.com/am15h/object_detection_flutter/raw/master/assets/detect.tflite , commit it to app/src/main/assets/detect.tflite, then rerun."
+              exit 1
+            fi
+          fi
+
+      - name: Fetch segmentation model (optional)
+        run: |
+          F=app/src/main/assets/deeplab_cityscapes.tflite
+          valid() { [ -f "$F" ] && [ "$(dd if="$F" bs=1 skip=4 count=4 2>/dev/null)" = "TFL3" ]; }
+          if ! valid; then
+            rm -f "$F"
+            for url in \
+              "https://cdn.jsdelivr.net/gh/google-coral/edgetpu@master/test_data/deeplabv3_mnv2_cityscapes_quant.tflite" \
+              "https://raw.githubusercontent.com/google-coral/edgetpu/master/test_data/deeplabv3_mnv2_cityscapes_quant.tflite"; do
+              echo "Trying: $url"
+              if curl -fL --retry 2 --connect-timeout 20 -o "$F" "$url" && valid; then
+                echo "Segmentation model OK: $(wc -c < "$F") bytes"; break
+              fi
+              rm -f "$F"
+            done
+            valid || echo "Segmentation model unavailable (optional) - continuing without it"
+          fi
+
+      - name: Build debug APK
+        run: gradle assembleDebug --stacktrace
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: guidelens-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 30
