@@ -29,7 +29,7 @@ class Detector(context: Context) {
         private const val TAG = "GuideLens/Detector"
 
         const val HFOV_DEG = 62.0
-        const val MIN_SCORE = 0.45f
+        const val MIN_SCORE = 0.35f
         const val MAX_RESULTS = 25
 
         // Assumed real-world heights (m) used for monocular distance estimation
