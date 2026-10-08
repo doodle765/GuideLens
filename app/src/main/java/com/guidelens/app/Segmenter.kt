@@ -27,10 +27,10 @@ class Segmenter(context: Context) {
 
     companion object {
         val OBSTACLE_IDS = setOf(3, 4, 5, 6, 7)
-        const val AREA_RATIO = 0.02f
+        const val AREA_RATIO = 0.04f
         const val STRIP_X0 = 0.35f   // center vertical strip, as in the web app
         const val STRIP_X1 = 0.65f
-        const val STRIP_Y0 = 0.45f
+        const val STRIP_Y0 = 0.50f
     }
 
     private var interpreter: Interpreter? = null
@@ -180,8 +180,8 @@ class Segmenter(context: Context) {
     /** Map normalized ground-line position to a distance band (same curve as the web app). */
     private fun ynToDist(yn: Float): Float? {
         val pts = arrayOf(
-            floatArrayOf(0.50f, 9f), floatArrayOf(0.60f, 7f),
-            floatArrayOf(0.72f, 5f), floatArrayOf(0.85f, 3f), floatArrayOf(1.0f, 1.2f)
+            floatArrayOf(0.56f, 9f), floatArrayOf(0.62f, 7f),
+            floatArrayOf(0.74f, 5f), floatArrayOf(0.86f, 3f), floatArrayOf(1.0f, 1.2f)
         )
         if (yn <= pts[0][0]) return null
         if (yn >= 1f) return 1.2f
