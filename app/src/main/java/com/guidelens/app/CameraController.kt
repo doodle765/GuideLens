@@ -87,6 +87,7 @@ class CameraController(
         }
 
         val analysis = ImageAnalysis.Builder()
+            .setTargetResolution(android.util.Size(1280, 720))
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .build()
         analysis.setAnalyzer(inferenceExecutor) { proxy -> processFrame(proxy) }
